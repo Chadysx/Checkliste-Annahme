@@ -1,0 +1,461 @@
+import React, { useEffect, useMemo, useState } from "react";
+import { Alert, FlatList, Image, Pressable, SafeAreaView, ScrollView, Text, TextInput, View } from "react-native";
+import * as SQLite from "expo-sqlite";
+import * as ImagePicker from "expo-image-picker";
+
+const db = SQLite.openDatabaseSync("autohaus_checklist.db");
+
+// ISO-ish: Template versioned, job stores version.
+const DEFAULT_TEMPLATE = {
+  name: "Serviceannahme Standard",
+  version: 1,
+  items: [
+    { key: "kundenangaben", label: "Kundenangaben vollständig", required: true },
+    { key: "fahrzeugdaten", label: "Fahrzeugdaten erfasst (VIN/KM/Kennzeichen)", required: true },
+    { key: "sichtpruefung", label: "Sichtprüfung außen (Schäden dokumentiert)", required: true },
+    { key: "innenraum", label: "Innenraum geprüft (Zubehör/Schäden)", required: false },
+    { key: "probefahrt", label: "Probefahrt / Geräuschprüfung (falls nötig)", required: false },
+    { key: "bremsen", label: "Bremsen-Check (Beläge/Scheiben Sichtkontrolle)", required: false },
+    { key: "reifen", label: "Reifenprofil/ Luftdruck geprüft", required: false },
+    { key: "fluids", label: "Flüssigkeiten geprüft (Öl/Kühlwasser/Wischwasser)", required: false },
+    { key: "angebot", label: "Angebot/Arbeitsumfang erklärt & bestätigt", required: true },
+    { key: "termin", label: "Termin & Ersatzmobilität geklärt", required: true },
+  ],
+};
+
+function nowISO() {
+  return new Date().toISOString();
+}
+
+function initDb() {
+  db.execSync(`
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE IF NOT EXISTS templates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      customer_name TEXT NOT NULL,
+      vehicle_model TEXT NOT NULL,
+      license_plate TEXT NOT NULL,
+      vin TEXT,
+      mileage_km INTEGER,
+      status TEXT NOT NULL,
+      template_version INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      closed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS job_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id INTEGER NOT NULL,
+      item_key TEXT NOT NULL,
+      label TEXT NOT NULL,
+      required INTEGER NOT NULL DEFAULT 0,
+      checked INTEGER NOT NULL DEFAULT 0,
+      note TEXT,
+      FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS job_photos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id INTEGER NOT NULL,
+      uri TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id INTEGER NOT NULL,
+      action TEXT NOT NULL,
+      payload_json TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+    );
+  `);
+
+  // Seed template if missing
+  const existing = db.getFirstSync(`SELECT id FROM templates WHERE name = ? AND version = ?`, [
+    DEFAULT_TEMPLATE.name,
+    DEFAULT_TEMPLATE.version,
+  ]);
+  if (!existing) {
+    db.runSync(`INSERT INTO templates (name, version, json, created_at) VALUES (?, ?, ?, ?)`, [
+      DEFAULT_TEMPLATE.name,
+      DEFAULT_TEMPLATE.version,
+      JSON.stringify(DEFAULT_TEMPLATE),
+      nowISO(),
+    ]);
+  }
+}
+
+function log(jobId, action, payload) {
+  db.runSync(`INSERT INTO audit_log (job_id, action, payload_json, created_at) VALUES (?, ?, ?, ?)`, [
+    jobId,
+    action,
+    payload ? JSON.stringify(payload) : null,
+    nowISO(),
+  ]);
+}
+
+function SectionTitle({ children }) {
+  return <Text style={{ fontSize: 18, fontWeight: "700", marginTop: 16, marginBottom: 8 }}>{children}</Text>;
+}
+
+function Pill({ text }) {
+  return (
+    <View style={{ paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999, backgroundColor: "#eee" }}>
+      <Text style={{ fontSize: 12, fontWeight: "600" }}>{text}</Text>
+    </View>
+  );
+}
+
+export default function App() {
+  const [screen, setScreen] = useState({ name: "list", jobId: null });
+  const [jobs, setJobs] = useState([]);
+  const [activeJob, setActiveJob] = useState(null);
+  const [items, setItems] = useState([]);
+  const [photos, setPhotos] = useState([]);
+  const [audit, setAudit] = useState([]);
+
+  // Create job form
+  const [customerName, setCustomerName] = useState("");
+  const [vehicleModel, setVehicleModel] = useState("");
+  const [licensePlate, setLicensePlate] = useState("");
+  const [vin, setVin] = useState("");
+  const [mileageKm, setMileageKm] = useState("");
+
+  useEffect(() => {
+    initDb();
+    refreshJobs();
+  }, []);
+
+  function refreshJobs() {
+    const rows = db.getAllSync(`SELECT * FROM jobs ORDER BY created_at DESC`);
+    setJobs(rows);
+  }
+
+  function openJob(jobId) {
+    const job = db.getFirstSync(`SELECT * FROM jobs WHERE id = ?`, [jobId]);
+    const its = db.getAllSync(`SELECT * FROM job_items WHERE job_id = ? ORDER BY id ASC`, [jobId]);
+    const ph = db.getAllSync(`SELECT * FROM job_photos WHERE job_id = ? ORDER BY created_at DESC`, [jobId]);
+    const au = db.getAllSync(`SELECT * FROM audit_log WHERE job_id = ? ORDER BY created_at DESC LIMIT 50`, [jobId]);
+
+    setActiveJob(job);
+    setItems(its);
+    setPhotos(ph);
+    setAudit(au);
+    setScreen({ name: "job", jobId });
+  }
+
+  function createJob() {
+    if (!customerName.trim() || !vehicleModel.trim() || !licensePlate.trim()) {
+      Alert.alert("Pflichtfelder fehlen", "Kunde, Fahrzeug und Kennzeichen sind Pflicht.");
+      return;
+    }
+
+    const tpl = db.getFirstSync(`SELECT * FROM templates WHERE name = ? AND version = ?`, [
+      DEFAULT_TEMPLATE.name,
+      DEFAULT_TEMPLATE.version,
+    ]);
+    const tplJson = JSON.parse(tpl.json);
+
+    const createdAt = nowISO();
+    const result = db.runSync(
+      `INSERT INTO jobs (customer_name, vehicle_model, license_plate, vin, mileage_km, status, template_version, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        customerName.trim(),
+        vehicleModel.trim(),
+        licensePlate.trim(),
+        vin.trim() || null,
+        mileageKm ? parseInt(mileageKm, 10) : null,
+        "IN_PROGRESS",
+        tplJson.version,
+        createdAt,
+      ]
+    );
+
+    const jobId = result.lastInsertRowId;
+
+    tplJson.items.forEach((it) => {
+      db.runSync(
+        `INSERT INTO job_items (job_id, item_key, label, required, checked, note) VALUES (?, ?, ?, ?, 0, NULL)`,
+        [jobId, it.key, it.label, it.required ? 1 : 0]
+      );
+    });
+
+    log(jobId, "JOB_CREATED", { createdAt, templateVersion: tplJson.version });
+
+    // Reset form
+    setCustomerName("");
+    setVehicleModel("");
+    setLicensePlate("");
+    setVin("");
+    setMileageKm("");
+
+    refreshJobs();
+    openJob(jobId);
+  }
+
+  function toggleItem(itemId, nextChecked) {
+    db.runSync(`UPDATE job_items SET checked = ? WHERE id = ?`, [nextChecked ? 1 : 0, itemId]);
+    const item = items.find((x) => x.id === itemId);
+    log(activeJob.id, "ITEM_TOGGLED", { itemKey: item?.item_key, checked: !!nextChecked });
+    openJob(activeJob.id);
+  }
+
+  function setItemNote(itemId, note) {
+    db.runSync(`UPDATE job_items SET note = ? WHERE id = ?`, [note, itemId]);
+  }
+
+  function saveItemNote(itemId) {
+    const item = db.getFirstSync(`SELECT * FROM job_items WHERE id = ?`, [itemId]);
+    log(activeJob.id, "ITEM_NOTE_UPDATED", { itemKey: item.item_key, note: item.note || "" });
+    openJob(activeJob.id);
+  }
+
+  const requiredIncomplete = useMemo(() => {
+    return items.filter((it) => it.required === 1 && it.checked === 0);
+  }, [items]);
+
+  async function addPhoto() {
+    if (!activeJob) return;
+
+    const perm = await ImagePicker.requestCameraPermissionsAsync();
+    if (!perm.granted) {
+      Alert.alert("Kamera-Rechte fehlen", "Ohne Kamera-Rechte keine Fotos. Überraschend, ich weiß.");
+      return;
+    }
+
+    const res = await ImagePicker.launchCameraAsync({
+      quality: 0.7,
+      exif: false,
+    });
+
+    if (res.canceled) return;
+
+    const uri = res.assets?.[0]?.uri;
+    if (!uri) return;
+
+    db.runSync(`INSERT INTO job_photos (job_id, uri, created_at) VALUES (?, ?, ?)`, [activeJob.id, uri, nowISO()]);
+    log(activeJob.id, "PHOTO_ADDED", { uri });
+    openJob(activeJob.id);
+  }
+
+  function closeJob() {
+    if (requiredIncomplete.length > 0) {
+      Alert.alert(
+        "Noch nicht abschließbar",
+        `Es fehlen Pflichtpunkte:\n\n${requiredIncomplete.map((x) => "• " + x.label).join("\n")}`
+      );
+      return;
+    }
+
+    const closedAt = nowISO();
+    db.runSync(`UPDATE jobs SET status = 'CLOSED', closed_at = ? WHERE id = ?`, [closedAt, activeJob.id]);
+    log(activeJob.id, "JOB_CLOSED", { closedAt });
+
+    refreshJobs();
+    openJob(activeJob.id);
+  }
+
+  function backToList() {
+    setScreen({ name: "list", jobId: null });
+    setActiveJob(null);
+    setItems([]);
+    setPhotos([]);
+    setAudit([]);
+    refreshJobs();
+  }
+
+  if (screen.name === "job" && activeJob) {
+    const statusPill = activeJob.status === "CLOSED" ? "Abgeschlossen" : "In Arbeit";
+
+    return (
+      <SafeAreaView style={{ flex: 1, padding: 16 }}>
+        <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+          <Pressable onPress={backToList} style={{ padding: 10, borderRadius: 10, backgroundColor: "#eee" }}>
+            <Text style={{ fontWeight: "700" }}>← Liste</Text>
+          </Pressable>
+          <Pill text={statusPill} />
+        </View>
+
+        <ScrollView style={{ marginTop: 12 }}>
+          <Text style={{ fontSize: 22, fontWeight: "800" }}>{activeJob.customer_name}</Text>
+          <Text style={{ marginTop: 6 }}>
+            {activeJob.vehicle_model} · {activeJob.license_plate}
+          </Text>
+          <Text style={{ marginTop: 4, color: "#555" }}>
+            VIN: {activeJob.vin || "-"} · KM: {activeJob.mileage_km ?? "-"} · Template v{activeJob.template_version}
+          </Text>
+
+          <SectionTitle>Checkliste</SectionTitle>
+          {items.map((it) => (
+            <View key={it.id} style={{ padding: 12, borderRadius: 14, backgroundColor: "#f6f6f6", marginBottom: 10 }}>
+              <View style={{ flexDirection: "row", justifyContent: "space-between", gap: 10 }}>
+                <View style={{ flex: 1 }}>
+                  <Text style={{ fontSize: 15, fontWeight: "700" }}>
+                    {it.label} {it.required === 1 ? <Text style={{ color: "#b00" }}>(Pflicht)</Text> : null}
+                  </Text>
+                </View>
+
+                <Pressable
+                  disabled={activeJob.status === "CLOSED"}
+                  onPress={() => toggleItem(it.id, it.checked === 0)}
+                  style={{
+                    paddingHorizontal: 12,
+                    paddingVertical: 8,
+                    borderRadius: 12,
+                    backgroundColor: it.checked ? "#d9f7d9" : "#fff",
+                    borderWidth: 1,
+                    borderColor: "#ddd",
+                  }}
+                >
+                  <Text style={{ fontWeight: "800" }}>{it.checked ? "✓" : "○"}</Text>
+                </Pressable>
+              </View>
+
+              <TextInput
+                editable={activeJob.status !== "CLOSED"}
+                placeholder="Notiz (optional)"
+                value={it.note || ""}
+                onChangeText={(t) => setItemNote(it.id, t)}
+                onBlur={() => saveItemNote(it.id)}
+                style={{
+                  marginTop: 10,
+                  padding: 10,
+                  borderRadius: 12,
+                  backgroundColor: "#fff",
+                  borderWidth: 1,
+                  borderColor: "#ddd",
+                }}
+              />
+            </View>
+          ))}
+
+          <SectionTitle>Fotos</SectionTitle>
+          <Pressable
+            disabled={activeJob.status === "CLOSED"}
+            onPress={addPhoto}
+            style={{ padding: 12, borderRadius: 14, backgroundColor: "#eee", alignItems: "center" }}
+          >
+            <Text style={{ fontWeight: "800" }}>Foto aufnehmen</Text>
+          </Pressable>
+
+          <View style={{ marginTop: 12, flexDirection: "row", flexWrap: "wrap", gap: 10 }}>
+            {photos.map((p) => (
+              <Image
+                key={p.id}
+                source={{ uri: p.uri }}
+                style={{ width: 110, height: 110, borderRadius: 14, backgroundColor: "#ddd" }}
+              />
+            ))}
+            {photos.length === 0 ? <Text style={{ color: "#666", marginTop: 8 }}>Noch keine Fotos.</Text> : null}
+          </View>
+
+          <SectionTitle>Audit-Log</SectionTitle>
+          {audit.map((a) => (
+            <View key={a.id} style={{ padding: 10, borderRadius: 12, backgroundColor: "#fafafa", marginBottom: 8 }}>
+              <Text style={{ fontWeight: "800" }}>{a.action}</Text>
+              <Text style={{ color: "#555", marginTop: 2 }}>{a.created_at}</Text>
+            </View>
+          ))}
+
+          <View style={{ height: 20 }} />
+
+          {activeJob.status !== "CLOSED" ? (
+            <Pressable onPress={closeJob} style={{ padding: 14, borderRadius: 16, backgroundColor: "#111" }}>
+              <Text style={{ color: "#fff", fontWeight: "900", textAlign: "center" }}>
+                Auftrag abschließen{requiredIncomplete.length ? ` (noch ${requiredIncomplete.length} Pflicht offen)` : ""}
+              </Text>
+            </Pressable>
+          ) : (
+            <View style={{ padding: 14, borderRadius: 16, backgroundColor: "#d9f7d9" }}>
+              <Text style={{ fontWeight: "900", textAlign: "center" }}>Abgeschlossen am {activeJob.closed_at}</Text>
+            </View>
+          )}
+
+          <View style={{ height: 40 }} />
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  // List + create job
+  return (
+    <SafeAreaView style={{ flex: 1, padding: 16 }}>
+      <Text style={{ fontSize: 24, fontWeight: "900" }}>Autohaus Checkliste</Text>
+      <Text style={{ marginTop: 6, color: "#666" }}>Serviceannahme, Fotos, ISO-taugliches Logging. Willkommen im Papierlos-Paradies.</Text>
+
+      <SectionTitle>Neuer Auftrag</SectionTitle>
+      <View style={{ gap: 10 }}>
+        <TextInput
+          placeholder="Kunde (Pflicht)"
+          value={customerName}
+          onChangeText={setCustomerName}
+          style={{ padding: 12, borderRadius: 14, borderWidth: 1, borderColor: "#ddd" }}
+        />
+        <TextInput
+          placeholder="Fahrzeug (Pflicht) z.B. Golf 7 1.6 TDI"
+          value={vehicleModel}
+          onChangeText={setVehicleModel}
+          style={{ padding: 12, borderRadius: 14, borderWidth: 1, borderColor: "#ddd" }}
+        />
+        <TextInput
+          placeholder="Kennzeichen (Pflicht)"
+          value={licensePlate}
+          onChangeText={setLicensePlate}
+          style={{ padding: 12, borderRadius: 14, borderWidth: 1, borderColor: "#ddd" }}
+        />
+        <TextInput
+          placeholder="VIN (optional)"
+          value={vin}
+          onChangeText={setVin}
+          style={{ padding: 12, borderRadius: 14, borderWidth: 1, borderColor: "#ddd" }}
+        />
+        <TextInput
+          placeholder="KM-Stand (optional)"
+          keyboardType="numeric"
+          value={mileageKm}
+          onChangeText={setMileageKm}
+          style={{ padding: 12, borderRadius: 14, borderWidth: 1, borderColor: "#ddd" }}
+        />
+
+        <Pressable onPress={createJob} style={{ padding: 14, borderRadius: 16, backgroundColor: "#111" }}>
+          <Text style={{ color: "#fff", fontWeight: "900", textAlign: "center" }}>Auftrag erstellen</Text>
+        </Pressable>
+      </View>
+
+      <SectionTitle>Aufträge</SectionTitle>
+      <FlatList
+        data={jobs}
+        keyExtractor={(j) => String(j.id)}
+        ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+        renderItem={({ item }) => (
+          <Pressable
+            onPress={() => openJob(item.id)}
+            style={{ padding: 12, borderRadius: 14, backgroundColor: "#f6f6f6" }}
+          >
+            <Text style={{ fontWeight: "900" }}>
+              {item.customer_name} · {item.license_plate}
+            </Text>
+            <Text style={{ marginTop: 4, color: "#555" }}>{item.vehicle_model}</Text>
+            <Text style={{ marginTop: 4, color: "#777" }}>
+              Status: {item.status === "CLOSED" ? "Abgeschlossen" : "In Arbeit"} · {item.created_at}
+            </Text>
+          </Pressable>
+        )}
+        ListEmptyComponent={<Text style={{ color: "#666", marginTop: 10 }}>Noch keine Aufträge.</Text>}
+        style={{ marginTop: 6 }}
+      />
+    </SafeAreaView>
+  );
+}
